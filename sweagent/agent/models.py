@@ -623,6 +623,39 @@ class LiteLLMModel(AbstractModel):
         self.custom_tokenizer = None
         if self.config.custom_tokenizer is not None:
             self.custom_tokenizer = litellm.utils.create_pretrained_tokenizer(**self.config.custom_tokenizer)
+        
+        # Store responses with token IDs for passing back in future turns
+        self.responses: list[dict] = []
+
+    def _add_tokens_ids_to_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """
+        Enriches assistant messages with token IDs from previous responses.
+        This enables KV cache reuse when the model recognizes previously computed tokens.
+        """
+        processed_messages = []
+        responses_idx = 0
+        
+        for message in messages:
+            if message["role"] in ["system", "user"]:
+                # User/system messages pass through unchanged
+                processed_messages.append(message)
+            elif message["role"] == "assistant":
+                # Enrich assistant message with token IDs from saved response
+                assistant_message = message.copy()
+                
+                if responses_idx < len(self.responses):
+                    response = self.responses[responses_idx]
+                    if response.get("provider_specific_fields", {}):
+                        provider_specific_fields = response["provider_specific_fields"]
+                        for key in ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]:
+                            if key in provider_specific_fields:
+                                assistant_message[key] = provider_specific_fields[key]
+                                self.logger.debug(f"Added {key} to assistant message (responses_idx={responses_idx})")
+                    responses_idx += 1
+                
+                processed_messages.append(assistant_message)
+        
+        return processed_messages
 
     @property
     def instance_cost_limit(self) -> float:
@@ -711,10 +744,15 @@ class LiteLLMModel(AbstractModel):
         completion_kwargs = self.config.completion_kwargs
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
+        
+        # Enrich messages with token IDs from previous responses for KV cache reuse
+        enriched_messages = self._add_tokens_ids_to_messages(messages)
+        self.logger.debug(f"Enriched  messages with token IDs from {len(self.responses)} previous responses {enriched_messages}")
+        
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
-                messages=messages,
+                messages=enriched_messages,  # Use enriched messages with token IDs
                 temperature=self.config.temperature if temperature is None else temperature,
                 top_p=self.config.top_p,
                 api_version=self.config.api_version,
@@ -769,7 +807,21 @@ class LiteLLMModel(AbstractModel):
                 and response.choices[i].message.thinking_blocks  # type: ignore
             ):
                 output_dict["thinking_blocks"] = response.choices[i].message.thinking_blocks  # type: ignore
+            if hasattr(response.choices[i], "logprobs") and response.choices[i].logprobs:  # type: ignore
+                output_dict["logprobs"] = response.choices[i].logprobs  # type: ignore
+            if hasattr(response.choices[i].message, "_hidden_params"):  # type: ignore
+                hidden_params = response.choices[i].message._hidden_params  # type: ignore
+            if hasattr(response.choices[0].message, "provider_specific_fields"):
+                provider_specific_fields = response.choices[0].message.provider_specific_fields
+                output_dict["provider_specific_fields"] = provider_specific_fields
+            else:
+                provider_specific_fields = {}
             outputs.append(output_dict)
+            
+            # Save response with token IDs for passing back in future turns
+            self.responses.append(output_dict)
+            self.logger.debug(f"Saved response to self.responses (total: {len(self.responses)})")
+        
         self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
 
