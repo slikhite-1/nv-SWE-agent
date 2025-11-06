@@ -623,39 +623,6 @@ class LiteLLMModel(AbstractModel):
         self.custom_tokenizer = None
         if self.config.custom_tokenizer is not None:
             self.custom_tokenizer = litellm.utils.create_pretrained_tokenizer(**self.config.custom_tokenizer)
-        
-        # Store responses with token IDs for passing back in future turns
-        self.responses: list[dict] = []
-
-    def _add_tokens_ids_to_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        """
-        Enriches assistant messages with token IDs from previous responses.
-        This enables KV cache reuse when the model recognizes previously computed tokens.
-        """
-        processed_messages = []
-        responses_idx = 0
-        
-        for message in messages:
-            if message["role"] in ["system", "user"]:
-                # User/system messages pass through unchanged
-                processed_messages.append(message)
-            elif message["role"] == "assistant":
-                # Enrich assistant message with token IDs from saved response
-                assistant_message = message.copy()
-                
-                if responses_idx < len(self.responses):
-                    response = self.responses[responses_idx]
-                    if response.get("provider_specific_fields", {}):
-                        provider_specific_fields = response["provider_specific_fields"]
-                        for key in ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]:
-                            if key in provider_specific_fields:
-                                assistant_message[key] = provider_specific_fields[key]
-                                self.logger.debug(f"Added {key} to assistant message (responses_idx={responses_idx})")
-                    responses_idx += 1
-                
-                processed_messages.append(assistant_message)
-        
-        return processed_messages
 
     @property
     def instance_cost_limit(self) -> float:
@@ -745,14 +712,13 @@ class LiteLLMModel(AbstractModel):
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
         
-        # Enrich messages with token IDs from previous responses for KV cache reuse
-        enriched_messages = self._add_tokens_ids_to_messages(messages)
-        self.logger.debug(f"Enriched  messages with token IDs from {len(self.responses)} previous responses {enriched_messages}")
+        # Token IDs are now extracted from history in _history_to_messages
+        self.logger.debug(f"Sending messages to model: {messages}")
         
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
-                messages=enriched_messages,  # Use enriched messages with token IDs
+                messages=messages,
                 temperature=self.config.temperature if temperature is None else temperature,
                 top_p=self.config.top_p,
                 api_version=self.config.api_version,
@@ -817,10 +783,6 @@ class LiteLLMModel(AbstractModel):
             else:
                 provider_specific_fields = {}
             outputs.append(output_dict)
-            
-            # Save response with token IDs for passing back in future turns
-            self.responses.append(output_dict)
-            self.logger.debug(f"Saved response to self.responses (total: {len(self.responses)})")
         
         self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
@@ -838,7 +800,6 @@ class LiteLLMModel(AbstractModel):
 
     def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
         messages = self._history_to_messages(history)
-
         def retry_warning(retry_state: RetryCallState):
             exception_info = ""
             if attempt.retry_state.outcome is not None and attempt.retry_state.outcome.exception() is not None:
@@ -880,6 +841,7 @@ class LiteLLMModel(AbstractModel):
                 result = self._query(messages, n=n, temperature=temperature)
         if n is None or n == 1:
             return result[0]
+        self.logger.debug(f"Result in query: {result}")
         return result
 
     def _history_to_messages(
@@ -892,7 +854,7 @@ class LiteLLMModel(AbstractModel):
             if history_item["role"] == "system":
                 return "user" if self.config.convert_system_to_user else "system"
             return history_item["role"]
-
+        self.logger.debug(f"History in _history_to_messages: {history}")
         messages = []
         for history_item in history:
             role = get_role(history_item)
@@ -911,6 +873,18 @@ class LiteLLMModel(AbstractModel):
                 message = {"role": role, "content": history_item["content"]}
             if "cache_control" in history_item:
                 message["cache_control"] = history_item["cache_control"]
+            
+            # Extract token IDs from history's provider_specific_fields for KV cache reuse
+            if role == "assistant" and "provider_specific_fields" in history_item:
+                provider_specific_fields = history_item["provider_specific_fields"]
+                for key in ["prompt_token_ids", "generation_token_ids", "generation_log_probs"]:
+                    if key in provider_specific_fields:
+                        message[key] = provider_specific_fields[key]
+                        self.logger.debug(f"Extracted {key} from history for assistant message")
+            elif role == "assistant" and "provider_specific_fields" not in history_item:
+                self.logger.debug(f"No provider_specific_fields in history for assistant message")
+        
+            self.logger.debug(f"Message in _history_to_messages: {message}")
             messages.append(message)
         n_cache_control = str(messages).count("cache_control")
         self.logger.debug(f"n_cache_control: {n_cache_control}")

@@ -723,6 +723,7 @@ class DefaultAgent(AbstractAgent):
                 "tool_calls": step.tool_calls,
                 "message_type": "action",
                 "thinking_blocks": step.thinking_blocks,
+                "provider_specific_fields": step.extra_info.get("provider_specific_fields", {}),
             },
         )
 
@@ -815,8 +816,16 @@ class DefaultAgent(AbstractAgent):
 
         self.logger.warning(f"{error_template}")
 
+        # Extract provider_specific_fields from kwargs if available (via extra_info)
+        assistant_msg = {"role": "assistant", "content": output, "agent": self.name, "message_type": "assistant"}
+        if "extra_info" in kwargs and isinstance(kwargs["extra_info"], dict):
+            extra_info = kwargs["extra_info"]
+            if "provider_specific_fields" in extra_info:
+                assistant_msg["provider_specific_fields"] = extra_info["provider_specific_fields"]
+                self.logger.debug(f"Added provider_specific_fields to requery assistant message")
+
         return self.messages + [
-            {"role": "assistant", "content": output, "agent": self.name, "message_type": "assistant"},
+            assistant_msg,
             {"role": "user", "content": error_template, "agent": self.name, "message_type": "user"},
         ]
 
@@ -1080,15 +1089,21 @@ class DefaultAgent(AbstractAgent):
             step_output: step output
         """
 
-        def handle_error_with_autosubmission(exit_status: str, message: str) -> StepOutput:
+        def handle_error_with_autosubmission(exit_status: str, message: str, exception: Exception | None = None) -> StepOutput:
             """Attempts to autosubmit (extract patch from the environment) and stops the loop."""
             self.logger.warning(message)
+            # Preserve provider_specific_fields from the last step if available from exception
+            # Note: Don't use trajectory fallback to avoid token_id mismatch with error message
+            extra_info = {}
+            if exception is not None and hasattr(exception, 'step') and hasattr(exception.step, 'extra_info'):
+                extra_info = exception.step.extra_info
             return self.attempt_autosubmission_after_error(
                 StepOutput(
                     thought=message,
                     exit_status=exit_status,
                     output=message,
                     done=True,
+                    extra_info=extra_info,
                 )
             )
 
@@ -1158,62 +1173,71 @@ class DefaultAgent(AbstractAgent):
 
             # Errors that cause exit
 
-            except _ExitForfeit:
+            except _ExitForfeit as e:
                 self.logger.info("Exiting due to forfeit")
                 return handle_error_with_autosubmission(
                     "exit_forfeit",
                     "Exiting due to forfeit",
+                    exception=e,
                 )
 
-            except _TotalExecutionTimeExceeded:
+            except _TotalExecutionTimeExceeded as e:
                 self.logger.exception("Exiting due to total execution time exceeded", exc_info=True)
                 return handle_error_with_autosubmission(
                     "exit_total_execution_time",
                     "Exit due to total execution time exceeded",
+                    exception=e,
                 )
 
-            except CommandTimeoutError:
+            except CommandTimeoutError as e:
                 self.logger.exception("Exiting due to multiple consecutive command timeouts", exc_info=True)
                 return handle_error_with_autosubmission(
                     "exit_command_timeout",
                     "Exit due to multiple consecutive command timeouts",
+                    exception=e,
                 )
 
-            except ContextWindowExceededError:
+            except ContextWindowExceededError as e:
                 return handle_error_with_autosubmission(
                     "exit_context",
                     "Exit due to context window",
+                    exception=e,
                 )
             except TotalCostLimitExceededError:
                 raise
-            except CostLimitExceededError:
+            except CostLimitExceededError as e:
                 return handle_error_with_autosubmission(
                     "exit_cost",
                     "Exit due to cost limit",
+                    exception=e,
                 )
             except RetryError as e:
                 self.logger.exception(f"Exiting due to retry error: {e}", exc_info=True)
                 return handle_error_with_autosubmission(
                     "exit_api",
                     f"Exit due to retry error: {e}",
+                    exception=e,
                 )
             except SwerexException as e:
                 self.logger.exception(f"Exiting due to environment error: {e}", exc_info=True)
                 return handle_error_with_autosubmission(
                     "exit_environment_error",
                     f"Exit due to environment error: {e}",
+                    exception=e,
                 )
             except RuntimeError as e:
                 self.logger.exception(f"Exiting due to runtime error: {e}", exc_info=True)
                 return handle_error_with_autosubmission(
                     "exit_error",
                     f"Exit due to runtime error: {e}",
+                    exception=e,
                 )
             except Exception as e:
                 self.logger.exception(f"Exiting due to unknown error: {e}", exc_info=True)
                 return handle_error_with_autosubmission(
                     "exit_error",
                     f"Exit due to unknown error: {e}",
+                    exception=e,
                 )
         self.logger.exception(
             "Exit due to repeated format/blocklist/bash syntax errors",
@@ -1225,12 +1249,28 @@ class DefaultAgent(AbstractAgent):
         )
 
     def add_step_to_trajectory(self, step: StepOutput) -> None:
+        # Serialize tool_calls to ensure all dict values are strings (for TrajectoryStep type)
+        serialized_tool_calls = None
+        if step.tool_calls:
+            serialized_tool_calls = []
+            for call in step.tool_calls:
+                serialized_call = {}
+                for key, value in call.items():
+                    if isinstance(value, dict):
+                        # Convert nested dicts (like 'function') to JSON strings
+                        serialized_call[key] = json.dumps(value)
+                    else:
+                        serialized_call[key] = str(value) if value is not None else ""
+                serialized_tool_calls.append(serialized_call)
+        
         trajectory_step = TrajectoryStep(
             {
                 "action": step.action,
                 "observation": step.observation,
                 "response": step.output,
                 "thought": step.thought,
+                "tool_calls": serialized_tool_calls,
+                "tool_call_ids": step.tool_call_ids,
                 "execution_time": step.execution_time,
                 "state": step.state,
                 "query": step.query,

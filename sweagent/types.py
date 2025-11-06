@@ -47,6 +47,8 @@ class TrajectoryStep(TypedDict):
     response: str
     state: dict[str, str]
     thought: str
+    tool_calls: list[dict[str, str]] | None
+    tool_call_ids: list[str] | None
     execution_time: float
     query: list[dict[str, Any]]
     extra_info: dict[str, Any]
@@ -70,6 +72,7 @@ class HistoryItem(_HistoryItem, total=False):
     tags: list[str]
     cache_control: dict[str, Any] | None
     thinking_blocks: list[dict[str, Any]] | None
+    provider_specific_fields: dict[str, Any] | None
 
     """HistoryProcessors can add these tags to enable special processing"""
 
