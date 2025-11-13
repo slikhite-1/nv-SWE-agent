@@ -7,6 +7,7 @@ import random
 import shlex
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from threading import Lock
@@ -287,6 +288,8 @@ Please use the `GLOBAL_STATS_LOCK` lock when accessing this object to avoid race
 
 GLOBAL_STATS_LOCK = Lock()
 """Lock for accessing `GLOBAL_STATS` without race conditions"""
+
+SET_COOKIE_ID = "set-cookie"
 
 
 class InstanceStats(PydanticBaseModel):
@@ -583,6 +586,8 @@ class LiteLLMModel(AbstractModel):
         self.stats = InstanceStats()
         self.tools = tools
         self.logger = get_logger("swea-lm", emoji="🤖")
+        self.response_headers = None
+        self.x_client_id = str(uuid.uuid4())
 
         if tools.use_function_calling:
             if not litellm.utils.supports_function_calling(model=self.config.name):
@@ -711,10 +716,20 @@ class LiteLLMModel(AbstractModel):
         completion_kwargs = self.config.completion_kwargs
         if self.lm_provider == "anthropic":
             completion_kwargs["max_tokens"] = self.model_max_output_tokens
-        
+
         # Token IDs are now extracted from history in _history_to_messages
         self.logger.debug(f"Sending messages to model: {messages}")
-        
+        raw_cookie = (
+            self.response_headers.get(SET_COOKIE_ID)
+            if self.response_headers and SET_COOKIE_ID in self.response_headers
+            else None
+        )
+        extra_headers = {}
+        extra_headers["X-Client-ID"] = self.x_client_id
+        if raw_cookie:
+            cookie_value = raw_cookie.split(";")[0].strip()
+            extra_headers["Cookie"] = cookie_value
+
         try:
             response: litellm.types.utils.ModelResponse = litellm.completion(  # type: ignore
                 model=self.config.name,
@@ -723,11 +738,15 @@ class LiteLLMModel(AbstractModel):
                 top_p=self.config.top_p,
                 api_version=self.config.api_version,
                 api_key=self.config.choose_api_key(),
+                extra_headers=extra_headers,
                 fallbacks=self.config.fallbacks,
                 **completion_kwargs,
                 **extra_args,
                 n=n,
             )
+            if not self.response_headers:
+                self.response_headers = response._response_headers
+
         except litellm.exceptions.ContextWindowExceededError as e:
             raise ContextWindowExceededError from e
         except litellm.exceptions.ContentPolicyViolationError as e:
@@ -783,7 +802,7 @@ class LiteLLMModel(AbstractModel):
             else:
                 provider_specific_fields = {}
             outputs.append(output_dict)
-        
+
         self._update_stats(input_tokens=input_tokens, output_tokens=output_tokens, cost=cost)
         return outputs
 
@@ -800,6 +819,7 @@ class LiteLLMModel(AbstractModel):
 
     def query(self, history: History, n: int = 1, temperature: float | None = None) -> list[dict] | dict:
         messages = self._history_to_messages(history)
+
         def retry_warning(retry_state: RetryCallState):
             exception_info = ""
             if attempt.retry_state.outcome is not None and attempt.retry_state.outcome.exception() is not None:
@@ -854,6 +874,7 @@ class LiteLLMModel(AbstractModel):
             if history_item["role"] == "system":
                 return "user" if self.config.convert_system_to_user else "system"
             return history_item["role"]
+
         self.logger.debug(f"History in _history_to_messages: {history}")
         messages = []
         for history_item in history:
@@ -873,7 +894,7 @@ class LiteLLMModel(AbstractModel):
                 message = {"role": role, "content": history_item["content"]}
             if "cache_control" in history_item:
                 message["cache_control"] = history_item["cache_control"]
-            
+
             # Extract token IDs from history's provider_specific_fields for KV cache reuse
             if role == "assistant" and "provider_specific_fields" in history_item:
                 provider_specific_fields = history_item["provider_specific_fields"]
@@ -883,7 +904,7 @@ class LiteLLMModel(AbstractModel):
                         self.logger.debug(f"Extracted {key} from history for assistant message")
             elif role == "assistant" and "provider_specific_fields" not in history_item:
                 self.logger.debug(f"No provider_specific_fields in history for assistant message")
-        
+
             self.logger.debug(f"Message in _history_to_messages: {message}")
             messages.append(message)
         n_cache_control = str(messages).count("cache_control")
