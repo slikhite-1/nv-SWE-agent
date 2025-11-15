@@ -1049,12 +1049,12 @@ class DefaultAgent(AbstractAgent):
                 step.extra_info.update(best.extra_info)
             else:
                 output = self.model.query(history)  # type: ignore
-            self.logger.debug(f"Output in forward: {output}")
+            #self.logger.debug(f"Output in forward: {output}")
             step.output = output["message"]
             # Add provider_specific_fields early in case parse_actions raises exception
             if output.get("provider_specific_fields") is not None:
                 step.extra_info["provider_specific_fields"] = output["provider_specific_fields"]
-                self.logger.debug(f"Added provider_specific_fields to step.extra_info: {list(output['provider_specific_fields'].keys())}")
+                #self.logger.debug(f"Added provider_specific_fields to step.extra_info: {list(output['provider_specific_fields'].keys())}")
             else:
                 self.logger.debug("No provider_specific_fields in output")
             # todo: Can't I override the parser in __init__?
