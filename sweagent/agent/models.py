@@ -755,7 +755,7 @@ class LiteLLMModel(AbstractModel):
             if "is longer than the model's context length" in str(e):
                 raise ContextWindowExceededError from e
             raise
-        self.logger.debug(f"Response: {response}")
+        #self.logger.debug(f"Response: {response}")
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=self.config.name)
         except Exception as e:
@@ -875,7 +875,7 @@ class LiteLLMModel(AbstractModel):
                 return "user" if self.config.convert_system_to_user else "system"
             return history_item["role"]
 
-        self.logger.debug(f"History in _history_to_messages: {history}")
+        #self.logger.debug(f"History in _history_to_messages: {history}")
         messages = []
         for history_item in history:
             role = get_role(history_item)
@@ -905,7 +905,7 @@ class LiteLLMModel(AbstractModel):
             elif role == "assistant" and "provider_specific_fields" not in history_item:
                 self.logger.debug(f"No provider_specific_fields in history for assistant message")
 
-            self.logger.debug(f"Message in _history_to_messages: {message}")
+            #self.logger.debug(f"Message in _history_to_messages: {message}")
             messages.append(message)
         n_cache_control = str(messages).count("cache_control")
         self.logger.debug(f"n_cache_control: {n_cache_control}")
